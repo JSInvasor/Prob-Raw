@@ -1,21 +1,28 @@
 //! prob-raw — yüksek performanslı HTTP/2 yük testi / benchmark aracı
 //!
 //! Kullanım:
-//!     prob-raw <url> <saniye> <threads>
+//!     prob-raw <url> <saniye> <threads> [connections]
 //!
 //! Örnek:
-//!     prob-raw https://example.com 30 200
+//!     prob-raw https://example.com 30 1000 16
 //!
 //! UYARI: Bu araç yalnızca sahibi olduğun ya da yük testi için açıkça
 //! izinli olduğun sistemlerde kullanılmalıdır. İzinsiz hedeflere yüksek
 //! hacimli trafik basmak DoS saldırısı sayılır ve yasa dışıdır.
+//!
+//! Performans notu (170k+ req/s için):
+//! HTTP/2'de reqwest bir host'a TEK bağlantı açıp onun üzerinden multiplex
+//! yapar. Sunucunun MAX_CONCURRENT_STREAMS limiti (genelde 100-250) yüzünden
+//! tek bağlantı üzerinden in-flight istek sınırlıdır. Bu yüzden burada birden
+//! fazla bağımsız bağlantı (`connections`) açıp worker'ları bunlara dağıtıyoruz.
+//! Toplam eşzamanlılık = threads; bağlantı başına ~ threads/connections akış.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use reqwest::{Client, Version};
+use reqwest::{Client, Url, Version};
 
 /// Tüm worker'ların paylaştığı canlı sayaçlar.
 struct Stats {
@@ -38,13 +45,14 @@ impl Stats {
 }
 
 fn print_usage(prog: &str) {
-    eprintln!("Kullanım: {prog} <url> <saniye> <threads>");
+    eprintln!("Kullanım: {prog} <url> <saniye> <threads> [connections]");
     eprintln!();
-    eprintln!("  <url>      Hedef adres (örn. https://example.com)");
-    eprintln!("  <saniye>   Test süresi, saniye cinsinden (örn. 30)");
-    eprintln!("  <threads>  Eşzamanlı worker / in-flight istek sayısı (örn. 200)");
+    eprintln!("  <url>          Hedef adres (örn. https://example.com)");
+    eprintln!("  <saniye>       Test süresi, saniye cinsinden (örn. 30)");
+    eprintln!("  <threads>      Eşzamanlı worker / in-flight istek sayısı (örn. 1000)");
+    eprintln!("  [connections]  Bağımsız HTTP/2 bağlantı sayısı (varsayılan: otomatik)");
     eprintln!();
-    eprintln!("Örnek: {prog} https://example.com 30 200");
+    eprintln!("Örnek: {prog} https://example.com 30 1000 16");
 }
 
 fn main() {
@@ -55,7 +63,7 @@ fn main() {
         .unwrap_or("prob-raw")
         .to_string();
 
-    if args.len() != 4 {
+    if args.len() < 4 || args.len() > 5 {
         print_usage(&prog);
         std::process::exit(2);
     }
@@ -76,47 +84,81 @@ fn main() {
         }
     };
 
-    // Runtime'ın OS thread sayısını CPU çekirdek sayısıyla sınırlıyoruz;
-    // gerçek eşzamanlılık (in-flight istek) `threads` async worker ile sağlanır.
-    let worker_os_threads = std::thread::available_parallelism()
+    let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
+    // connections: kullanıcı vermezse, bağlantı başına ~256 akış olacak şekilde
+    // otomatik seç (en az CPU çekirdek sayısı kadar). Bu sayede tek bağlantının
+    // MAX_CONCURRENT_STREAMS limiti darboğaz olmaz.
+    let connections: usize = if args.len() == 5 {
+        match args[4].parse() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                eprintln!("Hata: [connections] pozitif bir tam sayı olmalı.");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        ((threads + 255) / 256).max(cpus)
+    };
+    let connections = connections.min(threads); // bağlantı sayısı worker'dan fazla olmasın
+
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_os_threads)
+        .worker_threads(cpus)
         .enable_all()
         .build()
         .expect("tokio runtime kurulamadı");
 
-    rt.block_on(run(url, secs, threads));
+    rt.block_on(run(url, secs, threads, connections, cpus));
 }
 
-async fn run(url: String, secs: u64, threads: usize) {
-    let stats = Arc::new(Stats::new());
-
-    // HTTP/2 destekli, bağlantıları yeniden kullanan istemci.
-    // ALPN ile h2 müzakere edilir; multiplexing sayesinde tek bağlantı
-    // üzerinden çok sayıda eşzamanlı istek akar.
-    let client = Client::builder()
-        .user_agent("prob-raw/0.1")
+/// Maksimum throughput için bağımsız bir HTTP/2 istemcisi kurar.
+/// Her istemci kendi TCP/h2 bağlantısını açar; böylece tek bağlantının
+/// akış limiti darboğaz olmaz.
+fn build_client() -> Client {
+    Client::builder()
+        .user_agent("prob-raw/0.2")
         .http2_adaptive_window(true)
-        .pool_max_idle_per_host(threads)
+        // Akış ve bağlantı pencerelerini büyüterek küçük gövdelerde throughput artır.
+        .http2_initial_stream_window_size(4 * 1024 * 1024)
+        .http2_initial_connection_window_size(16 * 1024 * 1024)
+        // Bağlantıyı canlı tut, boşta kapanmasın.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .http2_keep_alive_timeout(Duration::from_secs(20))
+        .http2_keep_alive_while_idle(true)
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
-        .danger_accept_invalid_certs(false)
         .build()
-        .expect("HTTP istemcisi kurulamadı");
+        .expect("HTTP istemcisi kurulamadı")
+}
 
-    // İlk istekle bağlantıyı ısıt ve kullanılan protokol sürümünü öğren.
-    match client.get(&url).send().await {
+async fn run(url: String, secs: u64, threads: usize, connections: usize, cpus: usize) {
+    let stats = Arc::new(Stats::new());
+
+    // URL'i bir kez parse et; worker'lar her istekte yeniden parse etmesin.
+    let parsed = match Url::parse(&url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("Geçersiz URL: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Bağımsız istemci havuzu (her biri ayrı h2 bağlantısı).
+    let clients: Vec<Client> = (0..connections).map(|_| build_client()).collect();
+
+    // İlk istekle bağlantıyı ısıt ve protokol sürümünü öğren.
+    match clients[0].get(parsed.clone()).send().await {
         Ok(resp) => {
             let ver = version_str(resp.version());
-            println!("Hedef     : {url}");
-            println!("Protokol  : {ver}");
+            println!("Hedef       : {url}");
+            println!("Protokol    : {ver}");
             if resp.version() != Version::HTTP_2 {
                 eprintln!(
-                    "UYARI: Sunucu HTTP/2 müzakere etmedi ({ver} kullanılıyor). \
-                     Test yine de bu protokolle çalışacak."
+                    "UYARI: Sunucu HTTP/2 müzakere etmedi ({ver}). Test bu protokolle \
+                     devam edecek; HTTP/1.1'de bağlantı başına tek istek olacağı için \
+                     throughput çok daha düşük olur."
                 );
             }
         }
@@ -126,9 +168,10 @@ async fn run(url: String, secs: u64, threads: usize) {
         }
     }
 
-    println!("Süre      : {secs} sn");
-    println!("Worker    : {threads}");
-    println!("OS thread : {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+    println!("Süre        : {secs} sn");
+    println!("Worker      : {threads}");
+    println!("Bağlantı    : {connections}  (~{} akış/bağlantı)", threads / connections.max(1));
+    println!("OS thread   : {cpus}");
     println!("------------------------------------------------------------");
 
     let start = Instant::now();
@@ -162,25 +205,25 @@ async fn run(url: String, secs: u64, threads: usize) {
                 last = total;
                 let elapsed = start.elapsed().as_secs();
                 println!(
-                    "[{elapsed:>3}s] {rps:>8} req/s  | toplam: {total} | hata: {}",
+                    "[{elapsed:>3}s] {rps:>9} req/s  | toplam: {total} | hata: {}",
                     stats.failed.load(Ordering::Relaxed)
                 );
             }
         })
     };
 
-    // Worker'ları başlat. Her biri kendi histogram'ını tutar; sonda birleştiririz.
+    // Worker'ları başlat ve bağlantılara dağıt.
     let mut handles = Vec::with_capacity(threads);
-    for _ in 0..threads {
-        let client = client.clone();
+    for i in 0..threads {
+        let client = clients[i % connections].clone();
         let stats = Arc::clone(&stats);
-        let url = url.clone();
-        handles.push(tokio::spawn(async move {
-            worker(client, url, deadline, stats).await
-        }));
+        let url = parsed.clone();
+        handles.push(tokio::spawn(
+            async move { worker(client, url, deadline, stats).await },
+        ));
     }
 
-    // Süre dolunca durdur (worker'lar deadline'ı da kontrol ediyor).
+    // Süre dolunca durdur.
     {
         let stats = Arc::clone(&stats);
         tokio::spawn(async move {
@@ -203,10 +246,9 @@ async fn run(url: String, secs: u64, threads: usize) {
 }
 
 /// Tek bir worker: deadline'a ya da durdurma sinyaline kadar istek basar.
-/// Gecikmeleri mikrosaniye cinsinden kendi histogram'ına kaydeder.
 async fn worker(
     client: Client,
-    url: String,
+    url: Url,
     deadline: Instant,
     stats: Arc<Stats>,
 ) -> Histogram<u64> {
@@ -214,9 +256,9 @@ async fn worker(
 
     while stats.running.load(Ordering::Relaxed) && Instant::now() < deadline {
         let t0 = Instant::now();
-        match client.get(&url).send().await {
+        match client.get(url.clone()).send().await {
             Ok(resp) => {
-                // Gövdeyi tamamen oku ki stream kapansın ve gerçekçi olsun.
+                // Gövdeyi drain et ki h2 akışı kapansın ve slot serbest kalsın.
                 match resp.bytes().await {
                     Ok(body) => {
                         let micros = t0.elapsed().as_micros() as u64;
