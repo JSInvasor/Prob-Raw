@@ -1,0 +1,21 @@
+[package]
+name = "prob-raw"
+version = "0.1.0"
+edition = "2021"
+description = "Yüksek performanslı HTTP/2 yük testi / benchmark aracı"
+
+[[bin]]
+name = "prob-raw"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "gzip", "brotli"] }
+hdrhistogram = "7"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
